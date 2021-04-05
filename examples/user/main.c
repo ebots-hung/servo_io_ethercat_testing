@@ -1,31 +1,16 @@
-/*****************************************************************************
- *
- *  $Id$
- *
- *  Copyright (C) 2007-2009  Florian Pose, Ingenieurgemeinschaft IgH
- *
- *  This file is part of the IgH EtherCAT Master.
- *
- *  The IgH EtherCAT Master is free software; you can redistribute it and/or
- *  modify it under the terms of the GNU General Public License version 2, as
- *  published by the Free Software Foundation.
- *
- *  The IgH EtherCAT Master is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
- *  Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License along
- *  with the IgH EtherCAT Master; if not, write to the Free Software
- *  Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
- *
- *  ---
- *
- *  The license mentioned above concerns the source code only. Using the
- *  EtherCAT technology and brand is only permitted in compliance with the
- *  industrial property and similar rights of Beckhoff Automation GmbH.
- *
- ****************************************************************************/
+// =============================================================================
+// Copyright (C) EBOTS Inc.
+// =============================================================================
+// FILE NAME	: main.c
+// DEPARTMENT	: 
+// AUTHOR		: Hung Lam
+// DATE			: Apr 03 2021
+// =============================================================================
+// DESCRIPTION	: ECAT Test for Maxon motordrive
+// =============================================================================
+// REVISION HISTORY	:
+//	v1.0			: Initial version release
+// =============================================================================
 
 #include <errno.h>
 #include <signal.h>
@@ -35,9 +20,9 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <time.h> /* clock_gettime() */
-#include <sys/mman.h> /* mlockall() */
-#include <sched.h> /* sched_setscheduler() */
+#include <time.h>       /* clock_gettime() */
+#include <sys/mman.h>   /* mlockall() */
+#include <sched.h>      /* sched_setscheduler() */
 
 /****************************************************************************/
 
@@ -60,53 +45,111 @@
 
 /****************************************************************************/
 
-// EtherCAT
-static ec_master_t *master = NULL;
-static ec_master_state_t master_state = {};
+//master status
+typedef enum  _SysWorkingStatus
+{
+    SYS_WORKING_POWER_ON,
+    SYS_WORKING_SAFE_MODE,
+    SYS_WORKING_OP_MODE,
+    SYS_WORKING_LINK_DOWN,
+    SYS_WORKING_IDLE_STATUS       //System is idle
+}SysWorkingStatus;
 
-static ec_domain_t *domain1 = NULL;
-static ec_domain_state_t domain1_state = {};
+typedef  struct  _GSysRunningParm
+{
+    SysWorkingStatus   m_gWorkStatus;
+}GSysRunningParm;
 
-static ec_slave_config_t *sc_abt_io = NULL;
-static ec_slave_config_state_t sc_abt_io_state = {};
+GSysRunningParm    gSysRunning;
 
 /****************************************************************************/
 
+// EtherCAT
+// Master
+static ec_master_t      *master = NULL;
+static ec_master_state_t master_state = {};
+
+// domains
+static ec_domain_t      *domain_io = NULL;
+static ec_domain_state_t domain_io_state = {};
+
+static ec_domain_t      *domainServoInput = NULL;
+static ec_domain_state_t domainServoInput_state = {};
+static ec_domain_t      *domainServoOutput = NULL;
+static ec_domain_state_t domainServoOutput_state = {};
+
+static ec_slave_config_t        *sc_abt_io = NULL;
+static ec_slave_config_state_t  sc_abt_io_state = {};
+
+static ec_slave_config_t        *sc_maxondrive;
+static ec_slave_config_state_t  sc_maxondrive_state;
+
 // process data
-static uint8_t *domain1_pd = NULL;
+static uint8_t *domain_io_pd = NULL;
+static uint8_t *domain_maxondrive_out_pd = NULL;
+static uint8_t *domain_maxondrive_in_pd = NULL;
+
+/****************************************************************************/
 
 #define AbtIOSlavePos  0, 0
 #define MaxEp4SlavePos 0, 1
 
-// #define AnaInSlavePos  0, 3
-// #define AnaOutSlavePos 0, 4
-
+// Vendor ID, Product ID
 #define ABT_IOBOARD     0x0000079A, 0x00DEFEDE
 #define MAXON_EPOS4     0x000000FB, 0x60500000
 
-// #define Beckhoff_EK1100 0x00000002, 0x044c2c52
-// #define Beckhoff_EL2004 0x00000002, 0x07d43052
-// #define Beckhoff_EL2032 0x00000002, 0x07f03052
-// #define Beckhoff_EL3152 0x00000002, 0x0c503052
-// #define Beckhoff_EL3102 0x00000002, 0x0c1e3052
-// #define Beckhoff_EL4102 0x00000002, 0x10063052
-
 // offsets for PDO entries
+// IO board
 static unsigned int off_abt_out;
 static unsigned int off_abt_in;
-// static unsigned int off_ana_in_status;
-// static unsigned int off_ana_in_value;
-// static unsigned int off_ana_out;
-// static unsigned int off_dig_out;
+// Maxon servo drive
+static unsigned int cntlwd_x6040;
+static unsigned int tarpos_x607a;
+static unsigned int modeop_x6060;
+static unsigned int status_x6041;
+static unsigned int actpos_x6064;
+static unsigned int actvel_x606c;
+static unsigned int acttor_x6077;
+static unsigned int mopdis_x6061;
+// servo driver homing mode
+static unsigned int hommet_x6098;
+static unsigned int spswit_x6099;
+static unsigned int spzero_x6099;
+static unsigned int homacc_x609a;
+static unsigned int homoff_x30b1;
+static unsigned int hompos_x30b0;
 
-const static ec_pdo_entry_reg_t domain1_regs[] = {
+// process data
+// IO board
+const static ec_pdo_entry_reg_t domain_io_regs[] = {
     {AbtIOSlavePos, ABT_IOBOARD, 0x0005, 1, &off_abt_out, NULL},
     {AbtIOSlavePos, ABT_IOBOARD, 0x0006, 1, &off_abt_in, NULL},
-    // {MaxEp4SlavePos,  MAXON_EPOS4, 0x3101, 2, &off_ana_in_value},
-    // {AnaOutSlavePos, Beckhoff_EL4102, 0x3001, 1, &off_ana_out},
-    // {DigOutSlavePos, Beckhoff_EL2032, 0x3001, 1, &off_dig_out},
     {}
 };
+// Maxon motordrive
+const static ec_pdo_entry_reg_t domain_maxondrive_out_regs[] = {
+    {MaxEp4SlavePos, MAXON_EPOS4, 0x6040, 0x00, &cntlwd_x6040, NULL},           // Control word
+    {MaxEp4SlavePos, MAXON_EPOS4, 0x607a, 0x00, &tarpos_x607a, NULL},           // Target position
+    {MaxEp4SlavePos, MAXON_EPOS4, 0x6060, 0x00, &modeop_x6060, NULL},			// 6060 mode selection
+    {MaxEp4SlavePos, MAXON_EPOS4, 0x6098, 0x00, &hommet_x6098, NULL},			// Homing_method mode selection
+    {MaxEp4SlavePos, MAXON_EPOS4, 0x6099, 0x01, &spswit_x6099, NULL},			// speed_during_search_for_switch
+    {MaxEp4SlavePos, MAXON_EPOS4, 0x6099, 0x02, &spzero_x6099, NULL},			// speed_during_search_for_zero
+    {MaxEp4SlavePos, MAXON_EPOS4, 0x609a, 0x00, &homacc_x609a, NULL},			// homing_acceleration
+    {MaxEp4SlavePos, MAXON_EPOS4, 0x30b1, 0x00, &homoff_x30b1, NULL},			// home_offset
+    {MaxEp4SlavePos, MAXON_EPOS4, 0x30b0, 0x00, &hompos_x30b0, NULL},			// home_position
+    {}
+};
+const static ec_pdo_entry_reg_t domain_maxondrive_in_regs[] = {
+    {MaxEp4SlavePos, MAXON_EPOS4, 0x6041, 0x00, &status_x6041, NULL},           // Status word
+    {MaxEp4SlavePos, MAXON_EPOS4, 0x6064, 0x00, &actpos_x6064, NULL},           // Actual position
+    {MaxEp4SlavePos, MAXON_EPOS4, 0x606c, 0x00, &actvel_x606c, NULL},           // Actual Speed
+    {MaxEp4SlavePos, MAXON_EPOS4, 0x6077, 0x00, &acttor_x6077, NULL},           // Actual Torque
+    {MaxEp4SlavePos, MAXON_EPOS4, 0x6061, 0x00, &mopdis_x6061, NULL},           // Mode of operation display
+    {}
+};
+
+static int cur_status;
+static int cur_mode;
 
 static unsigned int counter = 0;
 static unsigned int blink = 0;
@@ -203,42 +246,78 @@ ec_sync_info_t slave_0_syncs[] = {
  * Revision number: 0x01610000
  */
 
-ec_pdo_entry_info_t slave_1_pdo_entries[] = {
-    {0x6040, 0x00, 16},
-    {0x6041, 0x00, 16},
+ec_pdo_entry_info_t maxon_pdo_entries[] = {
+    //CoE CSP Mode (RX)
+    {0x6040, 0x00, 16},     /* Controlword */
+    {0x607a, 0x00, 32},     /* Target Position */
+    {0x6060, 0x00, 8},      /*modes of operation*/
+    {0x6098, 0x00, 8},      /*Homing method*/
+    {0x6099, 0x01, 32},     /*Speed during search for switch*/
+    {0x6099, 0x02, 32},     /*Speed during search for zero*/
+    {0x609a, 0x00, 32},     /*homing_acceleration*/
+    {0x30b1, 0x00, 32},     /*home_offset*/
+    {0x30b0, 0x00, 32},     /*home_pos*/
+    //CoE CSP Mode (TX)
+    {0x6041, 0x00, 16},     /* Statusword */
+    {0x6064, 0x00, 32},     /* Position actual value */
+    {0x606c, 0x00, 32},     /* Speed actual value */
+    {0x6077, 0x00, 16},     /* Torque actual value */
+    {0x6061, 0x00, 8},      /*modes of operation display*/
 };
 
-ec_pdo_info_t slave_1_pdos[] = {
-    {0x1600, 1, slave_1_pdo_entries + 0},
-    {0x1a00, 1, slave_1_pdo_entries + 1},
+ec_pdo_info_t maxon_pdos[] = {
+    {0x1600, 9, maxon_pdo_entries + 0},     /* CoE CSP Mode (RX) */
+    {0x1a00, 5, maxon_pdo_entries + 9},     /* CoE CSP Mode (TX) */
 };
 
-ec_sync_info_t slave_1_syncs[] = {
+ec_sync_info_t maxon_syncs[] = {
     {0, EC_DIR_OUTPUT, 0, NULL, EC_WD_DISABLE},
     {1, EC_DIR_INPUT, 0, NULL, EC_WD_DISABLE},
-    {2, EC_DIR_OUTPUT, 1, slave_1_pdos + 0, EC_WD_ENABLE},
-    {3, EC_DIR_INPUT, 1, slave_1_pdos + 1, EC_WD_DISABLE},
+    {2, EC_DIR_OUTPUT, 1, maxon_pdos + 0, EC_WD_ENABLE},
+    {3, EC_DIR_INPUT, 1, maxon_pdos + 1, EC_WD_DISABLE},
     {0xff}
 };
 
 /*****************************************************************************/
 
-void check_domain1_state(void)
+void rt_check_domain_io_state(void)
 {
-    ec_domain_state_t ds;
-
-    ecrt_domain_state(domain1, &ds);
-
-    if (ds.working_counter != domain1_state.working_counter) {
-        // printf("Domain1: WC %u.\n", ds.working_counter);
+    ec_domain_state_t ds_io;
+    // domain io
+    ecrt_domain_state(domain_io, &ds_io);
+    if (ds_io.working_counter != domain_io_state.working_counter) {
+        // printf("domain_io: WC %u.\n", ds_io.working_counter);
     }
-    if (ds.wc_state != domain1_state.wc_state) {
-        // printf("Domain1: State %u.\n", ds.wc_state);
+    if (ds_io.wc_state != domain_io_state.wc_state) {
+        // printf("domain_io: State %u.\n", ds_io.wc_state);
     }
-
-    domain1_state = ds;
+    domain_io_state = ds_io;
+        
 }
 
+void rt_check_domain_maxondrive_state(void)
+{
+    ec_domain_state_t ds_maxon_in;
+    ec_domain_state_t ds_maxon_out;
+    // domain servo input
+    ecrt_domain_state(domainServoInput, &ds_maxon_in);
+    if (ds_maxon_in.working_counter != domainServoInput_state.working_counter) {
+        // printf("ds_maxon_in: WC %u.\n", ds_maxon_in.working_counter);
+    }
+    if (ds_maxon_in.wc_state != domainServoInput_state.wc_state) {
+        // printf("ds_maxon_in: State %u.\n", ds_maxon_in.wc_state);
+    }
+    domainServoInput_state = ds_maxon_in;   
+    // domain servo output
+    ecrt_domain_state(domainServoOutput, &ds_maxon_out);
+    if (ds_maxon_out.working_counter != domainServoOutput_state.working_counter) {
+        // printf("ds_maxon_out: WC %u.\n", ds_maxon_out.working_counter);
+    }
+    if (ds_maxon_out.wc_state != domainServoOutput_state.wc_state) {
+        // printf("ds_maxon_out: State %u.\n", ds_maxon_out.wc_state);
+    }
+    domainServoOutput_state = ds_maxon_out;      
+}
 /*****************************************************************************/
 
 void check_master_state(void)
@@ -262,35 +341,55 @@ void check_master_state(void)
 
 /*****************************************************************************/
 
-void check_slave_config_states(void)
+void check_io_slave_config_states(void)
 {
-    ec_slave_config_state_t s;
+    ec_slave_config_state_t s_io;
 
-    ecrt_slave_config_state(sc_abt_io, &s);
+    // IO board
+    ecrt_slave_config_state(sc_abt_io, &s_io);
 
-    if (s.al_state != sc_abt_io_state.al_state) {
-        printf("Abt IO board: State 0x%02X.\n", s.al_state);
+    if (s_io.al_state != sc_abt_io_state.al_state) {
+        printf("Abt IO board: State 0x%02X.\n", s_io.al_state);
     }
-    if (s.online != sc_abt_io_state.online) {
-        printf("AnaIn: %s.\n", s.online ? "online" : "offline");
+    if (s_io.online != sc_abt_io_state.online) {
+        printf("Abt IO board: %s.\n", s_io.online ? "online" : "offline");
     }
-    if (s.operational != sc_abt_io_state.operational) {
-        printf("AnaIn: %soperational.\n", s.operational ? "" : "Not ");
+    if (s_io.operational != sc_abt_io_state.operational) {
+        printf("Abt IO board: %soperational.\n", s_io.operational ? "" : "Not ");
     }
+    sc_abt_io_state = s_io;
+  
+}
 
-    sc_abt_io_state = s;
+void check_maxondrive_slave_config_states(void)
+{
+    ec_slave_config_state_t s_maxon;
+
+    // Maxon motordrive
+    ecrt_slave_config_state(sc_abt_io, &s_maxon);
+
+    if (s_maxon.al_state != sc_maxondrive_state.al_state) {
+        printf("Maxon Motordrive: State 0x%02X.\n", s_maxon.al_state);
+    }
+    if (s_maxon.online != sc_maxondrive_state.online) {
+        printf("Maxon Motordrive: %s.\n", s_maxon.online ? "online" : "offline");
+    }
+    if (s_maxon.operational != sc_maxondrive_state.operational) {
+        printf("Maxon Motordrive: %soperational.\n", s_maxon.operational ? "" : "Not ");
+    }
+    sc_maxondrive_state = s_maxon;    
 }
 
 /*****************************************************************************/
 
-void cyclic_task()
+void io_cyclic_task()
 {
     // receive process data
     ecrt_master_receive(master);
-    ecrt_domain_process(domain1);
+    ecrt_domain_process(domain_io);
 
     // check process data state
-    check_domain1_state();
+    rt_check_domain_io_state();
 
     if (counter) {
         counter--;
@@ -304,35 +403,39 @@ void cyclic_task()
         check_master_state();
 
         // check for slave configuration state(s) (optional)
-        check_slave_config_states();
+        check_io_slave_config_states();
     }
 
 #if 0
     // read process data
     printf("AnaIn: state %u value %u\n",
-            EC_READ_U8(domain1_pd + off_ana_in_status),
-            EC_READ_U16(domain1_pd + off_ana_in_value));
+            EC_READ_U8(domain_io_pd + off_ana_in_status),
+            EC_READ_U16(domain_io_pd + off_ana_in_value));
 #endif
 
 #if 1
     stickount++;
     if(stickount == 1000){
         printf("AnaIn0: %u - AnaIn1: %u - ContaUp.High: %u - ContaUp.Low: %u\n",
-        EC_READ_U8(domain1_pd + off_abt_in),
-        EC_READ_U8(domain1_pd + off_abt_in + 1),
-        EC_READ_U8(domain1_pd + off_abt_in + 3),
-        EC_READ_U8(domain1_pd + off_abt_in + 2));
+        EC_READ_U8(domain_io_pd + off_abt_in),
+        EC_READ_U8(domain_io_pd + off_abt_in + 1),
+        EC_READ_U8(domain_io_pd + off_abt_in + 3),
+        EC_READ_U8(domain_io_pd + off_abt_in + 2));
         stickount = 0; 
     }
     // write process data
-    EC_WRITE_U8(domain1_pd + off_abt_out, blink ? 0x00 : 0xff);
+    EC_WRITE_U8(domain_io_pd + off_abt_out, blink ? 0x00 : 0xff);
 #endif
 
     // send process data
-    ecrt_domain_queue(domain1);
+    ecrt_domain_queue(domain_io);
     ecrt_master_send(master);
 }
 
+void maxondrive_cyclic_task()
+{
+
+}
 /****************************************************************************/
 
 void stack_prefault(void)
@@ -355,8 +458,21 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    domain1 = ecrt_master_create_domain(master);
-    if (!domain1) {
+    // create domain_io
+    domain_io = ecrt_master_create_domain(master);
+    if (!domain_io) {
+        return -1;
+    }
+
+    // create domainServoInput
+    domainServoInput = ecrt_master_create_domain(master);
+    if (!domainServoInput) {
+        return -1;
+    }
+
+    // create domainServoOutput
+    domainServoOutput = ecrt_master_create_domain(master);
+    if (!domainServoOutput) {
         return -1;
     }
 
@@ -367,27 +483,52 @@ int main(int argc, char **argv)
         return -1;
     }
 
+    // Obtains a slave configuration - AB&T Ethercat Slave IO board
+    if (!(sc_maxondrive = ecrt_master_slave_config(
+                    master, MaxEp4SlavePos, MAXON_EPOS4))) {
+        fprintf(stderr, "Failed to get slave configuration.\n");
+        return -1;
+    }
+
     printf("Configuring PDOs...\n");
     if (ecrt_slave_config_pdos(sc_abt_io, EC_END, slave_0_syncs)) {
         fprintf(stderr, "Failed to configure PDOs.\n");
         return -1;
     }
 
-    if (ecrt_domain_reg_pdo_entry_list(domain1, domain1_regs)) {
+    if (ecrt_domain_reg_pdo_entry_list(domain_io, domain_io_regs)) {
         fprintf(stderr, "PDO entry registration failed!\n");
         return -1;
     }
 
-    printf("value of off_abt_out: %d\n", off_abt_out); 
-    printf("value of off_abt_in: %d\n", off_abt_in); 
+    if (ecrt_slave_config_pdos(sc_maxondrive, EC_END, maxon_syncs)) {
+        fprintf(stderr, "Failed to configure PDOs.\n");
+        return -1;
+    }
+    if (ecrt_domain_reg_pdo_entry_list(domainServoInput, domain_maxondrive_in_regs)) {
+        fprintf(stderr, "PDO entry registration failed!\n");
+        return -1;
+    }
+    if (ecrt_domain_reg_pdo_entry_list(domainServoOutput, domain_maxondrive_out_regs)) {
+        fprintf(stderr, "PDO entry registration failed!\n");
+        return -1;
+    }
+    // printf("value of off_abt_out: %d\n", off_abt_out); 
+    // printf("value of off_abt_in: %d\n", off_abt_in); 
     printf("Activating master...\n");
     if (ecrt_master_activate(master)) {
         return -1;
     }
 
-    if (!(domain1_pd = ecrt_domain_data(domain1))) {
+    if (!(domain_io_pd = ecrt_domain_data(domain_io))) {
         return -1;
     }
+    if (!(domain_maxondrive_out_pd = ecrt_domain_data(domainServoInput))) {
+        return -1;
+    }
+    if (!(domain_maxondrive_in_pd = ecrt_domain_data(domainServoOutput))) {
+        return -1;
+    }    
 
     /* Set priority */
 
@@ -422,7 +563,7 @@ int main(int argc, char **argv)
             break;
         }                   
 
-        cyclic_task();
+        io_cyclic_task();
 
         wakeup_time.tv_nsec += PERIOD_NS;
         while (wakeup_time.tv_nsec >= NSEC_PER_SEC) {
