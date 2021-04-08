@@ -7,6 +7,7 @@
 // DATE			: Apr 03 2021
 // =============================================================================
 // DESCRIPTION	: ECAT Test for Maxon motordrive
+//              : Motordrive is tested in PPM mode
 // =============================================================================
 // REVISION HISTORY	:
 //	v1.0			: Initial version release
@@ -40,9 +41,11 @@
 /****************************************************************************/
 
 /* Constants */
-#define NSEC_PER_SEC (1000000000)
-#define FREQUENCY (NSEC_PER_SEC / PERIOD_NS)
+#define NSEC_PER_SEC                        (1000000000)
+#define FREQUENCY                           (NSEC_PER_SEC / PERIOD_NS)
 
+#define ETHERCAT_STATUS_OP                  (0x08)
+#define STATUS_SERVO_ENABLE_BIT             (0x04)
 /****************************************************************************/
 
 //master status
@@ -63,6 +66,8 @@ typedef  struct  _GSysRunningParm
 GSysRunningParm    gSysRunning;
 
 /****************************************************************************/
+
+static int ecstate = 0;
 
 // EtherCAT
 // Master
@@ -434,7 +439,109 @@ void io_cyclic_task()
 
 void maxondrive_cyclic_task()
 {
+    static int curpos = 0;
+    static int curvel = 0;
+    //Just boot (need to wait for other operations to complete), return to wait for the next cycle
+    if(gSysRunning.m_gWorkStatus == SYS_WORKING_POWER_ON)
+        return ;
 
+    static int cycle_counter = 0;
+    cycle_counter++;
+    if(cycle_counter >= 120*1000){      // Max cycle counter
+        cycle_counter = 0;
+	    // run = 0;
+    }
+
+    // receive process data
+    ecrt_master_receive(master);
+    ecrt_domain_process(domainServoInput);
+    ecrt_domain_process(domainServoOutput);
+
+    // check process data state
+    rt_check_domain_maxondrive_state();
+
+    if (!(cycle_counter % 500)) {
+        check_master_state();
+        check_maxondrive_slave_config_states();
+    }
+
+    //State machine operation
+    switch (gSysRunning.m_gWorkStatus)
+    {
+        case SYS_WORKING_SAFE_MODE:
+            //Check whether the master station is in OP mode, if not, adjust to OP mode
+            check_master_state();
+            check_maxondrive_slave_config_states();
+            if((master_state.al_states & ETHERCAT_STATUS_OP))
+            {
+                if(sc_maxondrive_state.al_state != ETHERCAT_STATUS_OP){
+                    break ;
+                }
+
+                ecstate = 0;
+                gSysRunning.m_gWorkStatus = SYS_WORKING_OP_MODE;
+                printf("Maxon motor drive next-ecmode: SYS_WORKING_OP_MODE\n");
+                
+            }
+        break; 
+
+        case SYS_WORKING_OP_MODE: 
+            ecstate++;
+            //Enable servo
+            if(ecstate <= 1000){
+                switch (ecstate){
+                case 1:
+                    EC_WRITE_U8(domain_maxondrive_out_pd + modeop_x6060, 1);        // PPM mode
+                    break;
+                case 200:
+                    EC_WRITE_U16(domain_maxondrive_out_pd + cntlwd_x6040, 0x08);    //Error reset   
+                    break;
+                case 300:                   
+                    curpos  = EC_READ_S32(domain_maxondrive_in_pd + actpos_x6064);                       
+                    printf("x@rtITP >>> Axis current position = %d\n", curpos);
+                    break;
+                case 400:
+                    EC_WRITE_U16(domain_maxondrive_out_pd + cntlwd_x6040, 0x06);
+                    break;
+                case 500:
+                    EC_WRITE_U16(domain_maxondrive_out_pd + cntlwd_x6040, 0x0F);
+                    break;
+                }            
+            }
+            else {
+                printf("enable servo success!\n");
+                cur_mode= EC_READ_U8(domain_maxondrive_in_pd + mopdis_x6061);
+                printf("modes_of_operation_display 0x6061 = %d\n",cur_mode);
+
+                cur_status = EC_READ_U16(domain_maxondrive_in_pd + status_x6041);
+                printf("status_world 0x6041 = %d\n",cur_status);
+
+                if((EC_READ_U16(domain_maxondrive_in_pd + status_x6041) & (STATUS_SERVO_ENABLE_BIT)) == 0){
+                    break ;
+                }
+
+                ecstate = 0;
+                gSysRunning.m_gWorkStatus = SYS_WORKING_IDLE_STATUS;
+                printf("Maxon motor drive next-ecmode: SYS_WORKING_IDLE_STATUS\n");
+            }
+        break; 
+
+        default: 
+            if (!(cycle_counter % 2000)) {
+                // printout current position/velocity/status of maxon motordrive
+                cur_status = EC_READ_U16(domain_maxondrive_in_pd + status_x6041);
+                printf("cur_status: %d\t", cur_status);
+                curpos = EC_READ_S32(domain_maxondrive_in_pd + actpos_x6064);
+                printf("curpos = %d\t",curpos);
+                curvel = EC_READ_S32(domain_maxondrive_in_pd + actvel_x606c);
+                printf("curvel = %d\t",curvel);
+            }
+        break; 
+    }
+    // send process data
+    ecrt_domain_queue(domainServoInput);
+    ecrt_domain_queue(domainServoOutput);
+    ecrt_master_send(master);    
 }
 /****************************************************************************/
 
@@ -443,6 +550,18 @@ void stack_prefault(void)
     unsigned char dummy[MAX_SAFE_STACK];
 
     memset(dummy, 0, MAX_SAFE_STACK);
+}
+
+/****************************************************************************/
+
+void ReleaseMaster()
+{
+    if(master)
+    {
+        printf("Ethercat Test End of Program, release master\n");
+        ecrt_release_master(master);
+        master = NULL;
+    }
 }
 
 /****************************************************************************/
@@ -530,6 +649,13 @@ int main(int argc, char **argv)
         return -1;
     }    
 
+    gSysRunning.m_gWorkStatus = SYS_WORKING_POWER_ON;
+    if(gSysRunning.m_gWorkStatus == SYS_WORKING_POWER_ON){
+        ecstate = 0;
+        gSysRunning.m_gWorkStatus = SYS_WORKING_SAFE_MODE;
+        printf("Maxon motor drive next-ecmode: SYS_WORKING_SAFE_MODE\n");
+    }
+
     /* Set priority */
 
     struct sched_param param = {};
@@ -564,6 +690,7 @@ int main(int argc, char **argv)
         }                   
 
         io_cyclic_task();
+        maxondrive_cyclic_task();
 
         wakeup_time.tv_nsec += PERIOD_NS;
         while (wakeup_time.tv_nsec >= NSEC_PER_SEC) {
@@ -576,7 +703,7 @@ int main(int argc, char **argv)
         //     printf("Task cycle counter: %d\n", count);
         // }
     }
-
+    ReleaseMaster();
     return ret;
 }
 
