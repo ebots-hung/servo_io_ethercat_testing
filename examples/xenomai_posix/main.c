@@ -40,8 +40,8 @@
 #include <sys/mman.h>
 #include <time.h>
 
-#include <rtdm/rtdm.h>
-#include <rtdk.h>
+// #include <rtdm/rtdm.h>
+// #include <rtdk.h>
 
 #include "ecrt.h"
 

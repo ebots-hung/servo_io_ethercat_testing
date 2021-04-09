@@ -24,6 +24,8 @@
 #include <time.h>       /* clock_gettime() */
 #include <sys/mman.h>   /* mlockall() */
 #include <sched.h>      /* sched_setscheduler() */
+#include <pthread.h>
+// #include <rtdm/rtdm.h>
 
 /****************************************************************************/
 
@@ -66,6 +68,14 @@ typedef  struct  _GSysRunningParm
 GSysRunningParm    gSysRunning;
 
 /****************************************************************************/
+// Thread data
+static int iothread_run; // 0: exit, 1: run
+static int mdthread_run; // 0: exit, 1: run
+
+static unsigned int cycle_us = 1000; /* 1 ms */
+
+static pthread_t cyclic_thread;
+/****************************************************************************/
 
 static int ecstate = 0;
 
@@ -102,6 +112,12 @@ static uint8_t *domain_maxondrive_in_pd = NULL;
 // Vendor ID, Product ID
 #define ABT_IOBOARD     0x0000079A, 0x00DEFEDE
 #define MAXON_EPOS4     0x000000FB, 0x60500000
+
+// user mem-map for ethercat slaves
+static unsigned char    user_digou_u8; 
+static unsigned char    user_digin_u8; 
+static unsigned char    user_anain_u8[2]; 
+static unsigned char    user_cnter_u8[2]; 
 
 // offsets for PDO entries
 // IO board
@@ -284,6 +300,44 @@ ec_sync_info_t maxon_syncs[] = {
 };
 
 /*****************************************************************************/
+// TEST MENU
+typedef enum {
+    // Reserved - 0
+    MENU_ABT_DIG_RD = 1, 
+    MENU_ABT_DIG_WR, 
+    MENU_ABT_ANA_RD, 
+    MENU_MAXONDRIVE_INFO_RD, 
+    MENU_MAXONDRIVE_MOTI_WR, 
+    MENU_QUIT = 99
+} MENU_ID;
+
+static int user_sel = 0; 
+static int user_quit = 0; 
+
+void UI_ShowMenu(void){
+    // Menu display
+    printf(" __________________________________________________________ \r\n");
+	printf("|==========================================================|\r\n");
+	printf("| [%d]: ABT ECAT IOBOARD - DIGITAL READ                     |\r\n", MENU_ABT_DIG_RD);
+	printf("| [%d]: ABT ECAT IOBOARD - DIGITAL WRITE                    |\r\n", MENU_ABT_DIG_WR);
+	printf("| [%d]: ABT ECAT IOBOARD - ANALOG  READ                     |\r\n", MENU_ABT_ANA_RD);
+    printf("|----------------------------------------------------------|\r\n");
+	printf("| [%d]: MAXON ECAT DRIVE - STATUS  READ                     |\r\n", MENU_MAXONDRIVE_INFO_RD);
+	printf("| [%d]: MAXON ECAT DRIVE - MOTION  WRITE                    |\r\n", MENU_MAXONDRIVE_MOTI_WR);
+    printf("|----------------------------------------------------------|\r\n");
+	printf("| [%d]: Quit                                               |\r\n", MENU_QUIT);
+    printf("|==========================================================|\r\n");
+    // User Selection
+	printf(" Plesae input your selection:");
+}
+
+int UI_UserSelect(void){
+	int nSel;
+	scanf("%d", &nSel);
+	return nSel;
+}
+
+/*****************************************************************************/
 
 void rt_check_domain_io_state(void)
 {
@@ -401,9 +455,6 @@ void io_cyclic_task()
     } else { // do this at 1 Hz
         counter = FREQUENCY;
 
-        // calculate new process data
-        blink = !blink;
-
         // check for master state (optional)
         check_master_state();
 
@@ -411,25 +462,15 @@ void io_cyclic_task()
         check_io_slave_config_states();
     }
 
-#if 0
-    // read process data
-    printf("AnaIn: state %u value %u\n",
-            EC_READ_U8(domain_io_pd + off_ana_in_status),
-            EC_READ_U16(domain_io_pd + off_ana_in_value));
-#endif
-
 #if 1
-    stickount++;
-    if(stickount == 1000){
-        printf("AnaIn0: %u - AnaIn1: %u - ContaUp.High: %u - ContaUp.Low: %u\n",
-        EC_READ_U8(domain_io_pd + off_abt_in),
-        EC_READ_U8(domain_io_pd + off_abt_in + 1),
-        EC_READ_U8(domain_io_pd + off_abt_in + 3),
-        EC_READ_U8(domain_io_pd + off_abt_in + 2));
-        stickount = 0; 
-    }
+    user_anain_u8[0] = EC_READ_U8(domain_io_pd + off_abt_in + 0);
+    user_anain_u8[1] = EC_READ_U8(domain_io_pd + off_abt_in + 1);
+    user_cnter_u8[0] = EC_READ_U8(domain_io_pd + off_abt_in + 2);
+    user_cnter_u8[1] = EC_READ_U8(domain_io_pd + off_abt_in + 3);
+    user_digin_u8    = EC_READ_U8(domain_io_pd + off_abt_in + 6);
+
     // write process data
-    EC_WRITE_U8(domain_io_pd + off_abt_out, blink ? 0x00 : 0xff);
+    EC_WRITE_U8(domain_io_pd + off_abt_out, user_digou_u8);
 #endif
 
     // send process data
@@ -508,22 +549,22 @@ void maxondrive_cyclic_task()
                     break;
                 }            
             }
-            else {
-                printf("enable servo success!\n");
-                cur_mode= EC_READ_U8(domain_maxondrive_in_pd + mopdis_x6061);
-                printf("modes_of_operation_display 0x6061 = %d\n",cur_mode);
+            // else {
+            //     printf("enable servo success!\n");
+            //     cur_mode= EC_READ_U8(domain_maxondrive_in_pd + mopdis_x6061);
+            //     printf("modes_of_operation_display 0x6061 = %d\n",cur_mode);
 
-                cur_status = EC_READ_U16(domain_maxondrive_in_pd + status_x6041);
-                printf("status_world 0x6041 = %d\n",cur_status);
+            //     cur_status = EC_READ_U16(domain_maxondrive_in_pd + status_x6041);
+            //     printf("status_world 0x6041 = %d\n",cur_status);
 
-                if((EC_READ_U16(domain_maxondrive_in_pd + status_x6041) & (STATUS_SERVO_ENABLE_BIT)) == 0){
-                    break ;
-                }
+            //     if((EC_READ_U16(domain_maxondrive_in_pd + status_x6041) & (STATUS_SERVO_ENABLE_BIT)) == 0){
+            //         break ;
+            //     }
 
-                ecstate = 0;
-                gSysRunning.m_gWorkStatus = SYS_WORKING_IDLE_STATUS;
-                printf("Maxon motor drive next-ecmode: SYS_WORKING_IDLE_STATUS\n");
-            }
+            //     ecstate = 0;
+            //     gSysRunning.m_gWorkStatus = SYS_WORKING_IDLE_STATUS;
+            //     printf("Maxon motor drive next-ecmode: SYS_WORKING_IDLE_STATUS\n");
+            // }
         break; 
 
         default: 
@@ -565,18 +606,7 @@ void ReleaseMaster()
 }
 
 /****************************************************************************/
-
-int main(int argc, char **argv)
-{
-    // ec_slave_config_t *sc;
-    struct timespec wakeup_time;
-    int ret = 0;
-    int count = 100000; 
-    master = ecrt_request_master(0);
-    if (!master) {
-        return -1;
-    }
-
+int ConfigPDO(){
     // create domain_io
     domain_io = ecrt_master_create_domain(master);
     if (!domain_io) {
@@ -594,7 +624,7 @@ int main(int argc, char **argv)
     if (!domainServoOutput) {
         return -1;
     }
-
+    printf("ECAT Creating slave configurations...\n");
     // Obtains a slave configuration - AB&T Ethercat Slave IO board
     if (!(sc_abt_io = ecrt_master_slave_config(
                     master, AbtIOSlavePos, ABT_IOBOARD))) {
@@ -609,7 +639,7 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    printf("Configuring PDOs...\n");
+    printf("ECAT Configuring PDOs...\n");
     if (ecrt_slave_config_pdos(sc_abt_io, EC_END, slave_0_syncs)) {
         fprintf(stderr, "Failed to configure PDOs.\n");
         return -1;
@@ -634,10 +664,26 @@ int main(int argc, char **argv)
     }
     // printf("value of off_abt_out: %d\n", off_abt_out); 
     // printf("value of off_abt_in: %d\n", off_abt_in); 
-    printf("Activating master...\n");
+    return 0; 
+}
+
+/****************************************************************************/
+
+int ActivateMaster(void){
+    printf("ECAT Requesting master...\n");
+    master = ecrt_request_master(0);
+    if (!master) {
+        return -1;
+    }
+
+    ConfigPDO();
+   
+    /********************/
+    printf("ECAT Activating master...\n");
     if (ecrt_master_activate(master)) {
         return -1;
     }
+    /********************/
 
     if (!(domain_io_pd = ecrt_domain_data(domain_io))) {
         return -1;
@@ -648,61 +694,158 @@ int main(int argc, char **argv)
     if (!(domain_maxondrive_in_pd = ecrt_domain_data(domainServoOutput))) {
         return -1;
     }    
+    return 0; 
+}
+
+/****************************************************************************/
+//============================ TEST SUB-ROUTINES ===========================//
+
+void ABT_DIG_RD(){
+    printf("Digital Inputs: %u \r\n", user_digin_u8);
+}
+
+void ABT_DIG_WR(){
+    int Mask;
+
+    printf("Please enter digital value: ");
+	scanf("%d", &Mask);
+
+    // Read/Write Data
+    user_digou_u8 = (Mask > 255)? 255: ((Mask < 0)? 0: Mask);
+}
+
+void ABT_ANA_RD(){
+    // Read/Write Data
+    printf("Analog In0: %u - Analog In1: %u - ConterUp.High: %u - ConterUp.Low: %u \r\n",
+        user_anain_u8[0], user_anain_u8[1], user_cnter_u8[0], user_cnter_u8[1]);
+}
+
+void MAXONDRIVE_INFO_RD(){
+
+}
+
+void MAXONDRIVE_MOTI_WR(){
+
+}
+
+/****************************************************************************/
+//========================= IO THREAD PROGRAM ==============================//
+
+void *IOThread(void *arg){
+    struct timespec next_period;
+    clock_gettime(CLOCK_REALTIME, &next_period);
+
+    while (iothread_run){
+        next_period.tv_nsec += cycle_us * 1000;
+        while (next_period.tv_nsec >= NSEC_PER_SEC) {
+			next_period.tv_nsec -= NSEC_PER_SEC;
+			next_period.tv_sec++;
+		}
+        clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &next_period, NULL);
+        io_cyclic_task();
+    }
+    printf(" IO Thread termniated! \r\n"); 
+
+    return NULL; 
+}
+
+/****************************************************************************/
+//==================== MOTOR DRIVE THREAD PROGRAM ==========================//
+
+void MDThread(void){
+    while (mdthread_run){
+
+    }
+    printf(" Motor Drive Thread termniated! \r\n"); 
+}
+
+/****************************************************************************
+ * Signal handler
+ ***************************************************************************/
+
+void signal_handler(int sig)
+{
+    iothread_run = 0;
+    mdthread_run = 0; 
+}
+
+/****************************************************************************/
+//============================ MAIN PROGRAM ================================//
+
+int main(int argc, char **argv)
+{
+    // ec_slave_config_t *sc;
+    struct timespec wakeup_time;
+    int ret = 0;
+    int count = 100000; 
+    iothread_run = 1;
+    mdthread_run = 1; 
+
+    // rt_print_auto_init(1);
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT, signal_handler);
+    mlockall(MCL_CURRENT | MCL_FUTURE);
 
     gSysRunning.m_gWorkStatus = SYS_WORKING_POWER_ON;
     if(gSysRunning.m_gWorkStatus == SYS_WORKING_POWER_ON){
+        ActivateMaster(); 
         ecstate = 0;
         gSysRunning.m_gWorkStatus = SYS_WORKING_SAFE_MODE;
         printf("Maxon motor drive next-ecmode: SYS_WORKING_SAFE_MODE\n");
     }
 
-    /* Set priority */
 
-    struct sched_param param = {};
-    param.sched_priority = sched_get_priority_max(SCHED_FIFO);
+    /* Create cyclic RT-thread */
+    struct sched_param param = { .sched_priority = 82 };
+    pthread_attr_t thattr;
+    pthread_attr_init(&thattr);
+    pthread_attr_setdetachstate(&thattr, PTHREAD_CREATE_JOINABLE);
+    pthread_attr_setinheritsched(&thattr, PTHREAD_EXPLICIT_SCHED);
+    pthread_attr_setschedpolicy(&thattr, SCHED_FIFO);
+    pthread_setschedparam(cyclic_thread, SCHED_FIFO, &param);
 
-    printf("Using priority %i.", param.sched_priority);
-    if (sched_setscheduler(0, SCHED_FIFO, &param) == -1) {
-        perror("sched_setscheduler failed");
+    ret = pthread_create(&cyclic_thread, &thattr, &IOThread, NULL);
+    if (ret) {
+        fprintf(stderr, "%s: pthread_create cyclic task failed\n",
+                strerror(-ret));
+		return 1;
     }
 
-    /* Lock memory */
+    // User Interface
+    while (user_quit == 0) {
+        sched_yield();
+		UI_ShowMenu();
+		user_sel = UI_UserSelect();
+		switch (user_sel) {
+			case MENU_ABT_DIG_RD:
+				ABT_DIG_RD(); 
+				break;
+			case MENU_ABT_DIG_WR:
+				ABT_DIG_WR(); 
+				break;
+			case MENU_ABT_ANA_RD:
+				ABT_ANA_RD(); 
+				break;
+			case MENU_MAXONDRIVE_INFO_RD:
+				MAXONDRIVE_INFO_RD(); 
+				break;
+			case MENU_MAXONDRIVE_MOTI_WR:
+				MAXONDRIVE_MOTI_WR(); 
+				break;
+			
+			case MENU_QUIT:
+				user_quit = 1;
+                iothread_run = 0;
+                mdthread_run = 0; 
+				printf("ECAT Test Software Stopped - Bye!\r\n");
+				break;
+			default:
+				printf("[Warning] User Interface Invalid selection\r\n");
+		}// switch
+	}// while
 
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) == -1) {
-        fprintf(stderr, "Warning: Failed to lock memory: %s\n",
-                strerror(errno));
-    }
-
-    stack_prefault();
-
-    printf("Starting RT task with dt=%u ns.\n", PERIOD_NS);
-
-    clock_gettime(CLOCK_MONOTONIC, &wakeup_time);
-    wakeup_time.tv_sec += 1; /* start in future */
-    wakeup_time.tv_nsec = 0;
-
-    while (count > 0 ) {
-        ret = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME,
-                &wakeup_time, NULL);
-        if (ret) {
-            fprintf(stderr, "clock_nanosleep(): %s\n", strerror(ret));
-            break;
-        }                   
-
-        io_cyclic_task();
-        maxondrive_cyclic_task();
-
-        wakeup_time.tv_nsec += PERIOD_NS;
-        while (wakeup_time.tv_nsec >= NSEC_PER_SEC) {
-            wakeup_time.tv_nsec -= NSEC_PER_SEC;
-            wakeup_time.tv_sec++;
-        }
-        count --; 
-        // if(count%1000){}
-        // else{
-        //     printf("Task cycle counter: %d\n", count);
-        // }
-    }
+    pthread_join(cyclic_thread, NULL);
+    // Stop ECAT Test Software - Release Master
     ReleaseMaster();
     return ret;
 }
